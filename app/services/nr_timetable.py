@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 import fcntl
 import os
 from pathlib import Path
+import sqlite3
 from threading import RLock
 import zipfile
 
@@ -72,14 +73,20 @@ class TimetableCandidate:
 class NRTimetableService:
     """Load and match National Rail CIF timetable schedules from daily zip feed."""
 
-    def __init__(self, zip_path: str | None = None, enabled: bool | None = None):
+    def __init__(
+        self,
+        zip_path: str | None = None,
+        enabled: bool | None = None,
+        work_dir: str | None = None,
+    ):
         self.zip_path = zip_path or settings.nr_timetable_zip_path
         self.enabled = settings.nr_timetable_enabled if enabled is None else enabled
-        self.work_dir = Path(settings.nr_timetable_work_dir)
+        self.work_dir = Path(work_dir or settings.nr_timetable_work_dir)
         self._signature: tuple[str, int, int] | None = None
         self._mca_member: str | None = None
         self._msn_member: str | None = None
         self._mca_plain_path: Path | None = None
+        self._index_db_path: Path | None = None
         self._tiploc_to_crs: dict[str, str] = {}
         self._tiploc_to_name: dict[str, str] = {}
         self._station_cache: dict[tuple[tuple[str, int, int], str, str], list[TimetableSchedule]] = {}
@@ -169,6 +176,7 @@ class NRTimetableService:
             self._mca_member = None
             self._msn_member = None
             self._mca_plain_path = None
+            self._index_db_path = None
             self._tiploc_to_crs.clear()
             self._tiploc_to_name.clear()
             self._station_cache.clear()
@@ -239,7 +247,36 @@ class NRTimetableService:
         mca_plain_path = self._materialize_mca_plain(signature, mca_member)
         if not mca_plain_path:
             return []
+        schedules: list[TimetableSchedule] = []
 
+        index_path = self._ensure_sqlite_index(signature, mca_plain_path)
+        if index_path:
+            try:
+                schedules = self._load_station_schedules_from_index(
+                    index_path=index_path,
+                    station_crs=station_crs,
+                    service_date=service_date,
+                )
+            except Exception:
+                logger.exception("Failed loading station schedules from SQLite index")
+                schedules = []
+
+        if not schedules:
+            schedules = self._load_station_schedules_from_plain(
+                mca_plain_path=mca_plain_path,
+                station_crs=station_crs,
+                service_date=service_date,
+            )
+
+        self._remember_station_cache(key, schedules)
+        return schedules
+
+    def _load_station_schedules_from_plain(
+        self,
+        mca_plain_path: Path,
+        station_crs: str,
+        service_date: date,
+    ) -> list[TimetableSchedule]:
         schedules: list[TimetableSchedule] = []
         current: TimetableSchedule | None = None
         current_active = False
@@ -301,7 +338,6 @@ class NRTimetableService:
                         current_has_station = True
 
         finalize_schedule()
-        self._remember_station_cache(key, schedules)
         return schedules
 
     def _materialize_mca_plain(
@@ -348,6 +384,311 @@ class NRTimetableService:
     def _cleanup_old_materialized_mca(self, exclude: Path) -> None:
         pattern = "*.MCA.txt.*"
         for path in self.work_dir.glob(pattern):
+            if path == exclude:
+                continue
+            try:
+                path.unlink()
+            except Exception:
+                continue
+
+    def _ensure_sqlite_index(
+        self,
+        signature: tuple[str, int, int],
+        mca_plain_path: Path,
+    ) -> Path | None:
+        if self._index_db_path and self._index_db_path.exists():
+            return self._index_db_path
+
+        filename = f"nr_timetable.{signature[1]}.{signature[2]}.sqlite3"
+        target = self.work_dir / filename
+        lock_path = self.work_dir / "nr_timetable_index.lock"
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if target.exists() and target.stat().st_size > 0:
+                    self._index_db_path = target
+                    return target
+
+                temp_path = self.work_dir / f".{filename}.{os.getpid()}.tmp"
+                if temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+
+                logger.info("Building NR timetable SQLite index at %s", target)
+                self._build_sqlite_index(temp_path, mca_plain_path)
+                os.replace(temp_path, target)
+                self._index_db_path = target
+                self._cleanup_old_sqlite_indexes(exclude=target)
+                return target
+            except Exception:
+                logger.exception("Failed building NR timetable SQLite index")
+                return None
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _build_sqlite_index(self, db_path: Path, mca_plain_path: Path) -> None:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-200000")
+            conn.executescript(
+                """
+                CREATE TABLE schedules (
+                    schedule_id INTEGER PRIMARY KEY,
+                    train_uid TEXT NOT NULL,
+                    operator_code TEXT,
+                    service_type TEXT NOT NULL,
+                    start_date TEXT,
+                    end_date TEXT,
+                    days_run TEXT NOT NULL,
+                    stp_indicator TEXT NOT NULL
+                );
+                CREATE TABLE stops (
+                    schedule_id INTEGER NOT NULL,
+                    stop_seq INTEGER NOT NULL,
+                    tiploc TEXT NOT NULL,
+                    crs TEXT,
+                    location_name TEXT NOT NULL,
+                    working_arrival TEXT,
+                    working_departure TEXT,
+                    public_arrival TEXT,
+                    public_departure TEXT,
+                    platform TEXT
+                );
+                CREATE INDEX idx_stops_crs ON stops (crs);
+                CREATE INDEX idx_stops_schedule_seq ON stops (schedule_id, stop_seq);
+                CREATE INDEX idx_schedules_uid ON schedules (train_uid);
+                """
+            )
+
+            schedule_rows: list[tuple] = []
+            stop_rows: list[tuple] = []
+            schedule_id = 0
+            current_schedule: TimetableSchedule | None = None
+            current_deleted = False
+            current_stops: list[TimetableStop] = []
+
+            def flush_batches() -> None:
+                if schedule_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO schedules (
+                            schedule_id, train_uid, operator_code, service_type,
+                            start_date, end_date, days_run, stp_indicator
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        schedule_rows,
+                    )
+                    schedule_rows.clear()
+                if stop_rows:
+                    conn.executemany(
+                        """
+                        INSERT INTO stops (
+                            schedule_id, stop_seq, tiploc, crs, location_name,
+                            working_arrival, working_departure, public_arrival,
+                            public_departure, platform
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        stop_rows,
+                    )
+                    stop_rows.clear()
+
+            def finalize_schedule() -> None:
+                nonlocal schedule_id, current_schedule, current_deleted, current_stops
+                if not current_schedule or current_deleted or not current_stops:
+                    current_schedule = None
+                    current_deleted = False
+                    current_stops = []
+                    return
+
+                schedule_id += 1
+                schedule_rows.append(
+                    (
+                        schedule_id,
+                        current_schedule.train_uid,
+                        current_schedule.operator_code,
+                        current_schedule.service_type,
+                        self._date_to_iso(current_schedule.start_date),
+                        self._date_to_iso(current_schedule.end_date),
+                        current_schedule.days_run,
+                        current_schedule.stp_indicator,
+                    )
+                )
+                for seq, stop in enumerate(current_stops, start=1):
+                    stop_rows.append(
+                        (
+                            schedule_id,
+                            seq,
+                            stop.tiploc,
+                            stop.crs,
+                            stop.location_name,
+                            stop.working_arrival,
+                            stop.working_departure,
+                            stop.public_arrival,
+                            stop.public_departure,
+                            stop.platform,
+                        )
+                    )
+
+                if len(schedule_rows) >= 2000 or len(stop_rows) >= 50000:
+                    flush_batches()
+
+                current_schedule = None
+                current_deleted = False
+                current_stops = []
+
+            with mca_plain_path.open("r", encoding="latin-1", errors="ignore") as raw_file:
+                for raw_line in raw_file:
+                    line = raw_line.rstrip("\r\n")
+                    if len(line) < 2:
+                        continue
+                    record_type = line[:2]
+
+                    if record_type == "BS":
+                        finalize_schedule()
+                        transaction_type = line[2].strip().upper() or "N"
+                        train_uid = line[3:9].strip().upper()
+                        start_date = self._parse_cif_date(line[9:15])
+                        end_date = self._parse_cif_date(line[15:21])
+                        days_run = line[21:28]
+                        train_status = line[29:30].strip()
+                        stp_indicator = line[79:80].strip().upper() or "N"
+                        current_schedule = TimetableSchedule(
+                            train_uid=train_uid,
+                            operator_code=None,
+                            service_type="bus" if train_status == "5" else "train",
+                            start_date=start_date,
+                            end_date=end_date,
+                            days_run=days_run,
+                            stp_indicator=stp_indicator,
+                            stops=[],
+                        )
+                        current_deleted = transaction_type == "D" or stp_indicator == "C"
+                        current_stops = []
+                        continue
+
+                    if current_schedule is None:
+                        continue
+
+                    if record_type == "BX":
+                        operator_code = line[11:13].strip().upper()
+                        if operator_code:
+                            current_schedule.operator_code = operator_code
+                        continue
+
+                    if current_deleted:
+                        continue
+
+                    if record_type in {"LO", "LI", "LT"}:
+                        stop = self._parse_stop_record(line, record_type)
+                        if not stop:
+                            continue
+                        current_stops.append(stop)
+
+            finalize_schedule()
+            flush_batches()
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _load_station_schedules_from_index(
+        self,
+        index_path: Path,
+        station_crs: str,
+        service_date: date,
+    ) -> list[TimetableSchedule]:
+        conn = sqlite3.connect(index_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.schedule_id,
+                    s.train_uid,
+                    s.operator_code,
+                    s.service_type,
+                    s.start_date,
+                    s.end_date,
+                    s.days_run,
+                    s.stp_indicator,
+                    t.stop_seq,
+                    t.tiploc,
+                    t.crs,
+                    t.location_name,
+                    t.working_arrival,
+                    t.working_departure,
+                    t.public_arrival,
+                    t.public_departure,
+                    t.platform
+                FROM schedules s
+                JOIN stops t ON t.schedule_id = s.schedule_id
+                WHERE s.schedule_id IN (
+                    SELECT DISTINCT schedule_id FROM stops WHERE crs = ?
+                )
+                ORDER BY s.schedule_id, t.stop_seq
+                """,
+                (station_crs,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        schedules: list[TimetableSchedule] = []
+        current_schedule_id: int | None = None
+        current_schedule: TimetableSchedule | None = None
+
+        for row in rows:
+            schedule_id = int(row[0])
+            if schedule_id != current_schedule_id:
+                if current_schedule and self._runs_on_date(
+                    current_schedule.start_date,
+                    current_schedule.end_date,
+                    current_schedule.days_run,
+                    service_date,
+                ):
+                    schedules.append(current_schedule)
+
+                current_schedule_id = schedule_id
+                current_schedule = TimetableSchedule(
+                    train_uid=row[1],
+                    operator_code=row[2],
+                    service_type=row[3],
+                    start_date=self._parse_iso_date(row[4]),
+                    end_date=self._parse_iso_date(row[5]),
+                    days_run=row[6] or "1111111",
+                    stp_indicator=row[7] or "N",
+                    stops=[],
+                )
+
+            if current_schedule is None:
+                continue
+
+            current_schedule.stops.append(
+                TimetableStop(
+                    tiploc=row[9],
+                    crs=row[10],
+                    location_name=row[11],
+                    working_arrival=row[12],
+                    working_departure=row[13],
+                    public_arrival=row[14],
+                    public_departure=row[15],
+                    platform=row[16],
+                )
+            )
+
+        if current_schedule and self._runs_on_date(
+            current_schedule.start_date,
+            current_schedule.end_date,
+            current_schedule.days_run,
+            service_date,
+        ):
+            schedules.append(current_schedule)
+
+        return schedules
+
+    def _cleanup_old_sqlite_indexes(self, exclude: Path) -> None:
+        for path in self.work_dir.glob("nr_timetable.*.sqlite3"):
             if path == exclude:
                 continue
             try:
@@ -646,6 +987,21 @@ class NRTimetableService:
             if parsed:
                 return parsed.date()
         return datetime.now(timezone.utc).date()
+
+    @staticmethod
+    def _date_to_iso(value: date | None) -> str | None:
+        if value is None:
+            return None
+        return value.isoformat()
+
+    @staticmethod
+    def _parse_iso_date(value: str | None) -> date | None:
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
 
     @staticmethod
     def _parse_iso_datetime(value: str) -> datetime | None:
