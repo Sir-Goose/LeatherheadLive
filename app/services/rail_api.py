@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ import httpx
 from app.config import settings
 from app.middleware.cache import cache
 from app.models.board import Board, ServiceDetails, Train
+from app.services.nr_timetable import ServiceLookupHint, nr_timetable_service
 
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,60 @@ class RailAPIService:
 
     def _service_detail_cache_key(self, service_id: str) -> str:
         return f"nr:service_detail:{service_id}"
+
+    def _service_hint_cache_key(self, service_id: str) -> str:
+        return f"nr:service_hint:{service_id}"
+
+    def _service_hint_ttl(self) -> int:
+        return max(self._service_tracking_ttl(), 12 * 3600)
+
+    def _cache_board_service_hints(self, board: Board) -> None:
+        ttl = self._service_hint_ttl()
+        board_crs = self._normalize_crs(board.crs)
+        for train in board.trains:
+            if not train.service_id:
+                continue
+
+            origin_crs = self._normalize_crs(
+                train.origin[0].crs if train.origin else None
+            )
+            destination_crs = self._normalize_crs(
+                train.destination[0].crs if train.destination else None
+            )
+
+            hint_payload = {
+                "crs": board_crs,
+                "scheduled_arrival_time": train.scheduled_arrival_time,
+                "scheduled_departure_time": train.scheduled_departure_time,
+                "origin_crs": origin_crs,
+                "destination_crs": destination_crs,
+                "operator_code": (train.operator_code or "").strip().upper() or None,
+                "operator_name": train.operator,
+                "service_type": train.service_type or "train",
+                "generated_at": board.pulled_at or board.generated_at,
+            }
+            cache.set(self._service_hint_cache_key(train.service_id), hint_payload, ttl)
+
+    def _get_cached_service_hint(self, service_id: str) -> ServiceLookupHint | None:
+        cached = cache.get(self._service_hint_cache_key(service_id))
+        if not isinstance(cached, dict):
+            return None
+
+        crs = self._normalize_crs(cached.get("crs"))
+        if not crs:
+            return None
+
+        return ServiceLookupHint(
+            crs=crs,
+            scheduled_arrival_time=cached.get("scheduled_arrival_time"),
+            scheduled_departure_time=cached.get("scheduled_departure_time"),
+            origin_crs=self._normalize_crs(cached.get("origin_crs")),
+            destination_crs=self._normalize_crs(cached.get("destination_crs")),
+            operator_code=(cached.get("operator_code") or "").strip().upper() or None,
+            operator_name=cached.get("operator_name"),
+            service_type=cached.get("service_type"),
+            generated_at=cached.get("generated_at"),
+        )
 
     def _build_service_crs_candidates(self, service: ServiceDetails) -> list[str]:
         candidates: list[str] = []
@@ -274,9 +330,11 @@ class RailAPIService:
             cached_board = cache.get(cache_key)
             if cached_board:
                 if isinstance(cached_board, Board):
+                    self._cache_board_service_hints(cached_board)
                     return BoardFetchResult(board=cached_board, from_cache=True)
                 if isinstance(cached_board, dict):
                     parsed_cached_board = self._parse_board(cached_board)
+                    self._cache_board_service_hints(parsed_cached_board)
                     return BoardFetchResult(board=parsed_cached_board, from_cache=True)
         
         # Fetch from API using regular endpoint (not WithDetails) to get up to 150 trains
@@ -319,6 +377,7 @@ class RailAPIService:
                 )
 
             cache.set(cache_key, data, self.cache_ttl)
+            self._cache_board_service_hints(board)
             return BoardFetchResult(board=board, from_cache=False)
 
         except httpx.HTTPStatusError as exc:
@@ -449,6 +508,39 @@ class RailAPIService:
                 service.model_dump(mode="json", by_alias=True),
                 settings.service_prefetch_ttl_seconds,
             )
+        return service
+
+    async def get_service_route_from_timetable(
+        self,
+        crs_code: str,
+        service_id: str,
+    ) -> Optional[ServiceDetails]:
+        requested_crs = self._normalize_crs(crs_code)
+        if not requested_crs:
+            return None
+
+        hint = self._get_cached_service_hint(service_id)
+        if hint is None:
+            hint = ServiceLookupHint(crs=requested_crs)
+        elif not hint.crs:
+            hint.crs = requested_crs
+
+        try:
+            service = await asyncio.to_thread(
+                nr_timetable_service.find_service_detail,
+                service_id,
+                requested_crs,
+                hint,
+            )
+        except Exception:
+            logger.exception(
+                "Failed timetable fallback lookup for service %s at %s",
+                service_id,
+                requested_crs,
+            )
+            return None
+        if service:
+            self._cache_service_tracking(service_id, service)
         return service
 
     async def get_service_route_cached(

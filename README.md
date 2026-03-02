@@ -9,6 +9,7 @@ A FastAPI-powered web app for UK National Rail and TfL (Tube/Overground/DLR) liv
 - Unified station search across NR + TfL
 - TfL board UX grouped by line with line status summaries
 - Service route detail views for NR and TfL
+- NR service timetable fallback from CIF schedule feeds when live route detail is unavailable
 - Server-side service prefetch triggered by board loads and auto-refresh
 - SQLite-backed shared cache (single backend)
 - Cache-busted static assets tied to git commit
@@ -41,6 +42,7 @@ trains.mattdev.im/
 │   │   └── stations.py            # Station autocomplete endpoint
 │   ├── services/
 │   │   ├── rail_api.py            # National Rail API client
+│   │   ├── nr_timetable.py        # CIF timetable fallback parser/matcher
 │   │   ├── tfl_api.py             # TfL API client
 │   │   ├── station_search.py      # Unified local station search
 │   │   ├── prefetch.py            # Background service prefetch coordinator
@@ -205,6 +207,8 @@ Configuration can be set via environment variables or `.env`:
 ```env
 # National Rail API
 RAIL_API_KEY=your_api_key_here
+NR_TIMETABLE_ENABLED=true
+NR_TIMETABLE_ZIP_PATH=/srv/sftp/nre_sftp/incoming/timetable_full.zip
 
 # TfL API
 TFL_APP_KEY=your_tfl_app_key_here

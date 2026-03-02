@@ -227,6 +227,8 @@ async def board_search(crs: str, view: Optional[str] = "departures"):
 async def service_detail_page(request: Request, crs: str, service_id: str):
     crs = validate_crs(crs)
     service = await rail_api_service.get_service_route_following_cached(crs, service_id, use_cache=True)
+    if not service:
+        service = await rail_api_service.get_service_route_from_timetable(crs, service_id)
 
     if not service:
         return templates.TemplateResponse(
@@ -247,6 +249,8 @@ async def service_detail_page(request: Request, crs: str, service_id: str):
 async def service_detail_refresh(request: Request, crs: str, service_id: str):
     crs = validate_crs(crs)
     service = await rail_api_service.get_service_route_following(crs, service_id, use_cache=False)
+    if not service:
+        service = await rail_api_service.get_service_route_from_timetable(crs, service_id)
 
     if not service:
         return HTMLResponse(content="<div class='error-message'>Service no longer available</div>", status_code=200)

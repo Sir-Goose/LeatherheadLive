@@ -166,3 +166,85 @@ def test_nr_service_page_prefetches_clickable_boards(monkeypatch):
 
     assert response.status_code == 200
     assert set(calls) == {"LHD", "DKG", "EPS"}
+
+
+def test_nr_service_page_uses_timetable_fallback(monkeypatch):
+    service = ServiceDetails(
+        generatedAt="2026-01-01T12:00:00+00:00",
+        pulledAt="2026-01-01T12:00:00+00:00",
+        locationName="Leatherhead",
+        crs="LHD",
+        operator="South Western Railway",
+        operatorCode="SW",
+        serviceID="service-1",
+        std="21:10",
+        etd="On time",
+        origin=[{"locationName": "Guildford", "crs": "GLD"}],
+        destination=[{"locationName": "London Waterloo", "crs": "WAT"}],
+        previousCallingPoints=[{"callingPoint": [{"locationName": "Guildford", "crs": "GLD", "st": "20:50", "et": "On time"}]}],
+        subsequentCallingPoints=[{"callingPoint": [{"locationName": "London Waterloo", "crs": "WAT", "st": "21:40", "et": "On time"}]}],
+    )
+
+    async def fake_get_service_route_following_cached(crs: str, service_id: str, use_cache: bool = True):
+        return None
+
+    async def fake_get_service_route_from_timetable(crs: str, service_id: str):
+        assert crs == "LHD"
+        assert service_id == "service-1"
+        return service
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_following_cached',
+        fake_get_service_route_following_cached,
+    )
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_from_timetable',
+        fake_get_service_route_from_timetable,
+    )
+
+    client = TestClient(app)
+    response = client.get('/service/LHD/service-1')
+
+    assert response.status_code == 200
+    assert "Leatherhead" in response.text
+    assert "Guildford" in response.text
+    assert "London Waterloo" in response.text
+
+
+def test_nr_service_refresh_uses_timetable_fallback(monkeypatch):
+    service = ServiceDetails(
+        generatedAt="2026-01-01T12:00:00+00:00",
+        pulledAt="2026-01-01T12:00:00+00:00",
+        locationName="Leatherhead",
+        crs="LHD",
+        operator="South Western Railway",
+        operatorCode="SW",
+        serviceID="service-1",
+        std="21:10",
+        etd="On time",
+        origin=[{"locationName": "Guildford", "crs": "GLD"}],
+        destination=[{"locationName": "London Waterloo", "crs": "WAT"}],
+        previousCallingPoints=[{"callingPoint": [{"locationName": "Guildford", "crs": "GLD", "st": "20:50", "et": "On time"}]}],
+        subsequentCallingPoints=[{"callingPoint": [{"locationName": "London Waterloo", "crs": "WAT", "st": "21:40", "et": "On time"}]}],
+    )
+
+    async def fake_get_service_route_following(crs: str, service_id: str, use_cache: bool = True):
+        return None
+
+    async def fake_get_service_route_from_timetable(crs: str, service_id: str):
+        return service
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_following',
+        fake_get_service_route_following,
+    )
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_from_timetable',
+        fake_get_service_route_from_timetable,
+    )
+
+    client = TestClient(app)
+    response = client.get('/service/LHD/service-1/refresh')
+
+    assert response.status_code == 200
+    assert "Leatherhead" in response.text

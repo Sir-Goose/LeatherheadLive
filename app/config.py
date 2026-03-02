@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     rail_api_key: str = ""
     rail_api_num_rows: int = 150  # Maximum trains to return
     rail_api_time_window: int = 120  # Time window in minutes (2 hours)
+    nr_timetable_enabled: bool = True
+    nr_timetable_zip_path: str = "/srv/sftp/nre_sftp/incoming/timetable_full.zip"
 
     # TfL API Configuration
     tfl_api_base_url: str = "https://api.tfl.gov.uk"
