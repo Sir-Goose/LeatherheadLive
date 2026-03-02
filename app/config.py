@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     rail_api_time_window: int = 120  # Time window in minutes (2 hours)
     nr_timetable_enabled: bool = True
     nr_timetable_zip_path: str = "/srv/sftp/nre_sftp/incoming/timetable_full.zip"
+    nr_timetable_work_dir: str = "/tmp/trains_mattdev_nr_timetable"
 
     # TfL API Configuration
     tfl_api_base_url: str = "https://api.tfl.gov.uk"

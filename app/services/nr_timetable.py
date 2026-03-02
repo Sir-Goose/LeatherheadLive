@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+import fcntl
+import os
 from pathlib import Path
 from threading import RLock
 import zipfile
@@ -73,9 +75,11 @@ class NRTimetableService:
     def __init__(self, zip_path: str | None = None, enabled: bool | None = None):
         self.zip_path = zip_path or settings.nr_timetable_zip_path
         self.enabled = settings.nr_timetable_enabled if enabled is None else enabled
+        self.work_dir = Path(settings.nr_timetable_work_dir)
         self._signature: tuple[str, int, int] | None = None
         self._mca_member: str | None = None
         self._msn_member: str | None = None
+        self._mca_plain_path: Path | None = None
         self._tiploc_to_crs: dict[str, str] = {}
         self._tiploc_to_name: dict[str, str] = {}
         self._station_cache: dict[tuple[tuple[str, int, int], str, str], list[TimetableSchedule]] = {}
@@ -164,6 +168,7 @@ class NRTimetableService:
             self._signature = signature
             self._mca_member = None
             self._msn_member = None
+            self._mca_plain_path = None
             self._tiploc_to_crs.clear()
             self._tiploc_to_name.clear()
             self._station_cache.clear()
@@ -231,56 +236,124 @@ class NRTimetableService:
             return []
         if not self._ensure_tiploc_index(signature):
             return []
+        mca_plain_path = self._materialize_mca_plain(signature, mca_member)
+        if not mca_plain_path:
+            return []
 
         schedules: list[TimetableSchedule] = []
         current: TimetableSchedule | None = None
         current_active = False
+        current_has_station = False
+        current_stop_lines: list[tuple[str, str]] = []
 
         def finalize_schedule() -> None:
-            nonlocal current, current_active
-            if not current or not current_active or not current.stops:
+            nonlocal current, current_active, current_has_station, current_stop_lines
+            if not current or not current_active or not current_has_station or not current_stop_lines:
                 current = None
                 current_active = False
+                current_has_station = False
+                current_stop_lines = []
                 return
-            if any((stop.crs or "").upper() == station_crs for stop in current.stops):
+
+            parsed_stops: list[TimetableStop] = []
+            for record_type, line in current_stop_lines:
+                stop = self._parse_stop_record(line, record_type)
+                if stop:
+                    parsed_stops.append(stop)
+
+            if parsed_stops and any((stop.crs or "").upper() == station_crs for stop in parsed_stops):
+                current.stops = parsed_stops
                 schedules.append(current)
+
             current = None
             current_active = False
+            current_has_station = False
+            current_stop_lines = []
 
-        zip_path = signature[0]
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            with zf.open(mca_member, "r") as raw_file:
-                for raw_line in raw_file:
-                    line = raw_line.decode("latin-1").rstrip("\r\n")
-                    if len(line) < 2:
-                        continue
-                    record_type = line[:2]
+        with mca_plain_path.open("r", encoding="latin-1", errors="ignore") as raw_file:
+            for raw_line in raw_file:
+                line = raw_line.rstrip("\r\n")
+                if len(line) < 2:
+                    continue
+                record_type = line[:2]
 
-                    if record_type == "BS":
-                        finalize_schedule()
-                        current, current_active = self._parse_bs_record(line, service_date)
-                        continue
+                if record_type == "BS":
+                    finalize_schedule()
+                    current, current_active = self._parse_bs_record(line, service_date)
+                    continue
 
-                    if current is None:
-                        continue
+                if current is None:
+                    continue
 
-                    if record_type == "BX":
-                        operator_code = line[11:13].strip().upper()
-                        if operator_code:
-                            current.operator_code = operator_code
-                        continue
+                if record_type == "BX":
+                    operator_code = line[11:13].strip().upper()
+                    if operator_code:
+                        current.operator_code = operator_code
+                    continue
 
-                    if not current_active:
-                        continue
+                if not current_active:
+                    continue
 
-                    if record_type in {"LO", "LI", "LT"}:
-                        stop = self._parse_stop_record(line, record_type)
-                        if stop:
-                            current.stops.append(stop)
+                if record_type in {"LO", "LI", "LT"}:
+                    current_stop_lines.append((record_type, line))
+                    tiploc = line[2:9].strip().upper()
+                    if self._tiploc_to_crs.get(tiploc) == station_crs:
+                        current_has_station = True
 
         finalize_schedule()
         self._remember_station_cache(key, schedules)
         return schedules
+
+    def _materialize_mca_plain(
+        self,
+        signature: tuple[str, int, int],
+        mca_member: str,
+    ) -> Path | None:
+        if self._mca_plain_path and self._mca_plain_path.exists():
+            return self._mca_plain_path
+
+        safe_member = Path(mca_member).name.replace("/", "_")
+        filename = f"{safe_member}.{signature[1]}.{signature[2]}.txt"
+        target = self.work_dir / filename
+        lock_path = self.work_dir / f"{safe_member}.lock"
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                if target.exists() and target.stat().st_size > 0:
+                    self._mca_plain_path = target
+                    return target
+
+                temp_name = f".{filename}.{os.getpid()}.tmp"
+                temp_path = self.work_dir / temp_name
+                zip_path = signature[0]
+
+                logger.info("Extracting MCA member %s to %s", mca_member, target)
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    with zf.open(mca_member, "r") as src, temp_path.open("wb") as dst:
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+
+                os.replace(temp_path, target)
+                self._mca_plain_path = target
+                self._cleanup_old_materialized_mca(exclude=target)
+                return target
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _cleanup_old_materialized_mca(self, exclude: Path) -> None:
+        pattern = "*.MCA.txt.*"
+        for path in self.work_dir.glob(pattern):
+            if path == exclude:
+                continue
+            try:
+                path.unlink()
+            except Exception:
+                continue
 
     def _remember_station_cache(
         self,

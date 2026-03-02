@@ -209,6 +209,7 @@ Configuration can be set via environment variables or `.env`:
 RAIL_API_KEY=your_api_key_here
 NR_TIMETABLE_ENABLED=true
 NR_TIMETABLE_ZIP_PATH=/srv/sftp/nre_sftp/incoming/timetable_full.zip
+NR_TIMETABLE_WORK_DIR=/tmp/trains_mattdev_nr_timetable
 
 # TfL API
 TFL_APP_KEY=your_tfl_app_key_here
