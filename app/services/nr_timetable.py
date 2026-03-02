@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import RLock, Thread
+import time
 import zipfile
 
 from app.config import settings
@@ -150,6 +151,78 @@ class NRTimetableService:
                 best.score,
             )
             return self._build_service_details(service_id, requested, hint, best)
+
+    def prebuild_index(self) -> dict[str, object]:
+        with self._lock:
+            started = time.perf_counter()
+            if not self.enabled:
+                return {
+                    "status": "disabled",
+                    "zip_path": self.zip_path,
+                    "work_dir": str(self.work_dir),
+                }
+
+            signature = self._refresh_signature()
+            if not signature:
+                return {
+                    "status": "missing_zip",
+                    "zip_path": self.zip_path,
+                    "work_dir": str(self.work_dir),
+                }
+
+            mca_member, msn_member = self._resolve_members(signature)
+            if not mca_member or not msn_member:
+                return {
+                    "status": "missing_members",
+                    "zip_path": self.zip_path,
+                    "mca_member": mca_member,
+                    "msn_member": msn_member,
+                    "work_dir": str(self.work_dir),
+                }
+
+            if not self._ensure_tiploc_index(signature):
+                return {
+                    "status": "missing_msn_index",
+                    "zip_path": self.zip_path,
+                    "msn_member": msn_member,
+                    "work_dir": str(self.work_dir),
+                }
+
+            mca_plain_path = self._materialize_mca_plain(signature, mca_member)
+            if not mca_plain_path:
+                return {
+                    "status": "mca_extract_failed",
+                    "zip_path": self.zip_path,
+                    "mca_member": mca_member,
+                    "work_dir": str(self.work_dir),
+                }
+
+            index_path = self._ensure_sqlite_index(
+                signature=signature,
+                mca_plain_path=mca_plain_path,
+                wait=True,
+            )
+            if not index_path:
+                return {
+                    "status": "index_build_failed",
+                    "zip_path": self.zip_path,
+                    "mca_member": mca_member,
+                    "mca_plain_path": str(mca_plain_path),
+                    "work_dir": str(self.work_dir),
+                }
+
+            elapsed = round(time.perf_counter() - started, 3)
+            return {
+                "status": "ok",
+                "zip_path": self.zip_path,
+                "work_dir": str(self.work_dir),
+                "mca_member": mca_member,
+                "msn_member": msn_member,
+                "mca_plain_path": str(mca_plain_path),
+                "index_path": str(index_path),
+                "tiploc_count": len(self._tiploc_to_name),
+                "elapsed_seconds": elapsed,
+            }
 
     def _is_better_candidate(
         self,

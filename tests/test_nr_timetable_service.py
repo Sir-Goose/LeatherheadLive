@@ -161,3 +161,18 @@ def test_timetable_service_builds_sqlite_index_and_reuses_it(tmp_path):
     sqlite_files = list(work_dir.glob("nr_timetable.*.sqlite3"))
     assert len(sqlite_files) == 1
     assert sqlite_files[0].stat().st_size > 0
+
+
+def test_prebuild_index_returns_ready_metadata(tmp_path):
+    zip_path = tmp_path / "timetable_full.zip"
+    work_dir = tmp_path / "work"
+    _write_fixture_zip(zip_path)
+    service = NRTimetableService(zip_path=str(zip_path), enabled=True, work_dir=str(work_dir))
+
+    result = service.prebuild_index()
+
+    assert result["status"] == "ok"
+    assert result["mca_member"] == "TESTMCA.TXT"
+    assert result["msn_member"] == "TESTMSN.TXT"
+    assert int(result["tiploc_count"]) >= 5
+    assert Path(str(result["index_path"])).exists()

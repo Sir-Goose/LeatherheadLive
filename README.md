@@ -98,6 +98,12 @@ trains.mattdev.im/
    ```
    This writes `app/static/data/tfl_stations.json`, used by `/api/stations/search` for fast local TfL autocomplete.
 
+5. (Optional) Prebuild NR timetable index:
+   ```bash
+   python -m app.tools.build_nr_timetable_index
+   ```
+   This precomputes the SQLite index used by NR timetable fallback lookups.
+
 ## Running the Server
 
 ```bash
