@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 import fcntl
 import os
 from pathlib import Path
+import re
 import sqlite3
 from threading import RLock, Thread
 import time
@@ -13,6 +14,7 @@ import zipfile
 
 from app.config import settings
 from app.models.board import Location, ServiceDetails
+from app.services.station_search import get_station_by_crs
 
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,7 @@ class NRTimetableService:
         self._station_cache_order: list[tuple[tuple[str, int, int], str, str]] = []
         self._station_cache_max_entries = 8
         self._lock = RLock()
+        self._station_name_by_crs: dict[str, str] = {}
 
     def find_service_detail(
         self,
@@ -1063,7 +1066,7 @@ class NRTimetableService:
             "generatedAt": generated_at,
             "pulledAt": generated_at,
             "serviceType": schedule.service_type,
-            "locationName": current_stop.location_name,
+            "locationName": self._display_location_name(current_stop),
             "crs": requested_crs,
             "operator": operator_name,
             "operatorCode": operator_code,
@@ -1083,7 +1086,7 @@ class NRTimetableService:
 
     def _to_location(self, stop: TimetableStop, fallback_crs: str) -> Location:
         crs = self._normalize_crs(stop.crs) or self._normalize_crs(fallback_crs) or "UNK"
-        return Location(locationName=stop.location_name, crs=crs)
+        return Location(locationName=self._display_location_name(stop), crs=crs)
 
     def _to_calling_point(self, stop: TimetableStop) -> dict | None:
         arrival = stop.arrival_time
@@ -1094,7 +1097,7 @@ class NRTimetableService:
 
         crs = self._normalize_crs(stop.crs) or stop.tiploc
         point = {
-            "locationName": stop.location_name,
+            "locationName": self._display_location_name(stop),
             "crs": crs,
             "st": scheduled,
             "et": "On time",
@@ -1103,6 +1106,63 @@ class NRTimetableService:
             point["pta"] = arrival
             point["eta"] = "On time"
         return point
+
+    def _display_location_name(self, stop: TimetableStop) -> str:
+        canonical = self._canonical_station_name(stop.crs)
+        if canonical:
+            return canonical
+        return self._normalize_location_name(stop.location_name)
+
+    def _canonical_station_name(self, crs: str | None) -> str | None:
+        normalized_crs = self._normalize_crs(crs)
+        if not normalized_crs:
+            return None
+        cached = self._station_name_by_crs.get(normalized_crs)
+        if cached:
+            return cached
+
+        station = get_station_by_crs(normalized_crs)
+        if isinstance(station, dict):
+            name = (station.get("stationName") or "").strip()
+            if name:
+                self._station_name_by_crs[normalized_crs] = name
+                return name
+        return None
+
+    @staticmethod
+    def _normalize_location_name(name: str | None) -> str:
+        value = (name or "").strip()
+        if not value:
+            return value
+        # Only transform clearly all-caps names from timetable MSN rows.
+        if any(ch.islower() for ch in value):
+            return value
+
+        tokens: list[str] = []
+        for token in value.split():
+            if len(token) <= 3 and token.isalpha():
+                tokens.append(token.upper())
+                continue
+            parts = re.split(r"([-&/'])", token)
+            rebuilt: list[str] = []
+            capitalize_next = True
+            for part in parts:
+                if part == "":
+                    continue
+                if part in {"-", "&", "/", "'"}:
+                    rebuilt.append(part)
+                    capitalize_next = part != "'"
+                    continue
+                lower_part = part.lower()
+                if lower_part in {"of", "and", "the"} and rebuilt:
+                    rebuilt.append(lower_part)
+                elif capitalize_next:
+                    rebuilt.append(lower_part[:1].upper() + lower_part[1:])
+                else:
+                    rebuilt.append(lower_part)
+                capitalize_next = False
+            tokens.append("".join(rebuilt))
+        return " ".join(tokens)
 
     def _schedule_origin_crs(self, schedule: TimetableSchedule) -> str | None:
         for stop in schedule.stops:

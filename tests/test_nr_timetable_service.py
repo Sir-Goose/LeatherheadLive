@@ -113,15 +113,19 @@ def test_timetable_service_matches_best_schedule(tmp_path):
     )
 
     assert detail is not None
-    assert detail.locationName == "LEATHERHEAD"
+    assert detail.locationName == "Leatherhead"
     assert detail.crs == "LHD"
+    assert detail.origin[0].locationName == "Guildford"
     assert detail.origin[0].crs == "GLD"
+    assert detail.destination[0].locationName == "London Waterloo"
     assert detail.destination[0].crs == "WAT"
     assert detail.std == "21:10"
     assert detail.sta == "21:10"
     assert detail.operatorCode == "SW"
     assert len(detail.all_previous_stops) == 1
     assert len(detail.all_subsequent_stops) == 1
+    assert detail.all_previous_stops[0].locationName == "Guildford"
+    assert detail.all_subsequent_stops[0].locationName == "London Waterloo"
 
 
 def test_timetable_service_returns_none_when_source_missing(tmp_path):
@@ -157,6 +161,12 @@ def test_timetable_service_builds_sqlite_index_and_reuses_it(tmp_path):
 
     assert first is not None
     assert second is not None
+    assert first.locationName == "Leatherhead"
+    assert second.locationName == "Leatherhead"
+    assert first.origin[0].locationName == "Guildford"
+    assert first.destination[0].locationName == "London Waterloo"
+    assert second.origin[0].locationName == "Guildford"
+    assert second.destination[0].locationName == "London Waterloo"
 
     sqlite_files = list(work_dir.glob("nr_timetable.*.sqlite3"))
     assert len(sqlite_files) == 1
