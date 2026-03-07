@@ -194,9 +194,9 @@ def schedule_nr_service_boards_prefetch(service) -> None:
             prefetch_service.schedule_nr_board_prefetch(normalized)
 
     add(getattr(service, "crs", None))
-    for stop in getattr(service, "all_previous_stops", []) or []:
+    for stop in getattr(service, "all_previous_station_stops", []) or []:
         add(getattr(stop, "crs", None))
-    for stop in getattr(service, "all_subsequent_stops", []) or []:
+    for stop in getattr(service, "all_subsequent_station_stops", []) or []:
         add(getattr(stop, "crs", None))
 
 

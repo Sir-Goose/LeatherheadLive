@@ -312,7 +312,7 @@ class ServiceDetails(BaseModel):
         for cpl in self.previousCallingPoints:
             stops.extend(cpl.callingPoint)
         return stops
-    
+
     @property
     def all_subsequent_stops(self) -> List[CallingPoint]:
         """Flatten subsequent calling points into a single list"""
@@ -322,6 +322,23 @@ class ServiceDetails(BaseModel):
         for cpl in self.subsequentCallingPoints:
             stops.extend(cpl.callingPoint)
         return stops
+
+    @staticmethod
+    def _is_station_crs(value: Optional[str]) -> bool:
+        if not value:
+            return False
+        crs = value.strip().upper()
+        return len(crs) == 3 and crs.isalpha()
+
+    @property
+    def all_previous_station_stops(self) -> List[CallingPoint]:
+        """Flatten previous calling points, keeping only real station stops."""
+        return [stop for stop in self.all_previous_stops if self._is_station_crs(stop.crs)]
+
+    @property
+    def all_subsequent_station_stops(self) -> List[CallingPoint]:
+        """Flatten subsequent calling points, keeping only real station stops."""
+        return [stop for stop in self.all_subsequent_stops if self._is_station_crs(stop.crs)]
     
     @property
     def origin_name(self) -> str:

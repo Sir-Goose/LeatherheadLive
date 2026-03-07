@@ -168,6 +168,57 @@ def test_nr_service_page_prefetches_clickable_boards(monkeypatch):
     assert set(calls) == {"LHD", "DKG", "EPS"}
 
 
+def test_nr_service_page_excludes_non_station_timing_points(monkeypatch):
+    service = ServiceDetails(
+        generatedAt="2026-01-01T12:00:00+00:00",
+        pulledAt="2026-01-01T12:00:00+00:00",
+        locationName="Selhurst",
+        crs="SRS",
+        operator="Southern",
+        operatorCode="SN",
+        serviceID="service-2",
+        origin=[{"locationName": "East Croydon", "crs": "ECR"}],
+        destination=[{"locationName": "Watford Junction", "crs": "WFJ"}],
+        previousCallingPoints=[
+            {"callingPoint": [{"locationName": "Windmill Bridge Junction", "crs": "WNDMLBJ", "st": "12:11", "et": "On time"}]}
+        ],
+        subsequentCallingPoints=[
+            {
+                "callingPoint": [
+                    {"locationName": "Balham", "crs": "BAL", "st": "12:29", "et": "On time"},
+                    {"locationName": "North Pole Junction", "crs": "NPLE813", "st": "12:57", "et": "On time"},
+                    {"locationName": "Willesden Junction", "crs": "WIJ", "st": "13:02", "et": "On time"},
+                ]
+            }
+        ],
+    )
+
+    async def fake_get_service_route_cached(crs: str, service_id: str, use_cache: bool = True):
+        return service
+
+    calls: list[str] = []
+
+    def fake_schedule_nr_board_prefetch(crs: str):
+        calls.append(crs)
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_cached',
+        fake_get_service_route_cached,
+    )
+    monkeypatch.setattr('app.routers.pages.prefetch_service.schedule_nr_board_prefetch', fake_schedule_nr_board_prefetch)
+
+    client = TestClient(app)
+    response = client.get('/service/SRS/service-2')
+
+    assert response.status_code == 200
+    assert "Balham" in response.text
+    assert "Willesden Junction" in response.text
+    assert "Windmill Bridge Junction" not in response.text
+    assert "North Pole Junction" not in response.text
+    assert response.text.count('class="timeline-stop"') == 3
+    assert set(calls) == {"SRS", "BAL", "WIJ"}
+
+
 def test_nr_service_page_uses_timetable_fallback(monkeypatch):
     service = ServiceDetails(
         generatedAt="2026-01-01T12:00:00+00:00",
@@ -248,3 +299,93 @@ def test_nr_service_refresh_uses_timetable_fallback(monkeypatch):
 
     assert response.status_code == 200
     assert "Leatherhead" in response.text
+
+
+def test_nr_service_refresh_excludes_non_station_timing_points(monkeypatch):
+    service = ServiceDetails(
+        generatedAt="2026-01-01T12:00:00+00:00",
+        pulledAt="2026-01-01T12:00:00+00:00",
+        locationName="Selhurst",
+        crs="SRS",
+        operator="Southern",
+        operatorCode="SN",
+        serviceID="service-3",
+        origin=[{"locationName": "East Croydon", "crs": "ECR"}],
+        destination=[{"locationName": "Watford Junction", "crs": "WFJ"}],
+        previousCallingPoints=[
+            {"callingPoint": [{"locationName": "Streatham Junction", "crs": "STRENJN", "st": "12:26", "et": "On time"}]}
+        ],
+        subsequentCallingPoints=[
+            {
+                "callingPoint": [
+                    {"locationName": "Clapham Junction", "crs": "CLJ", "st": "12:34", "et": "On time"},
+                    {"locationName": "Willesden N7", "crs": "WLSDNN7", "st": "13:03", "et": "On time"},
+                    {"locationName": "Wembley Central", "crs": "WMB", "st": "13:09", "et": "On time"},
+                ]
+            }
+        ],
+    )
+
+    async def fake_get_service_route(crs: str, service_id: str, use_cache: bool = True):
+        return service
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route',
+        fake_get_service_route,
+    )
+
+    client = TestClient(app)
+    response = client.get('/service/SRS/service-3/refresh')
+
+    assert response.status_code == 200
+    assert "Clapham Junction" in response.text
+    assert "Wembley Central" in response.text
+    assert "Streatham Junction" not in response.text
+    assert "Willesden N7" not in response.text
+    assert response.text.count('class="timeline-stop"') == 3
+
+
+def test_nr_service_refresh_prefetch_excludes_non_station_timing_points(monkeypatch):
+    service = ServiceDetails(
+        generatedAt="2026-01-01T12:00:00+00:00",
+        pulledAt="2026-01-01T12:00:00+00:00",
+        locationName="Selhurst",
+        crs="SRS",
+        operator="Southern",
+        operatorCode="SN",
+        serviceID="service-4",
+        origin=[{"locationName": "East Croydon", "crs": "ECR"}],
+        destination=[{"locationName": "Watford Junction", "crs": "WFJ"}],
+        previousCallingPoints=[
+            {"callingPoint": [{"locationName": "Windmill Bridge Junction", "crs": "WNDMLBJ", "st": "12:11", "et": "On time"}]}
+        ],
+        subsequentCallingPoints=[
+            {
+                "callingPoint": [
+                    {"locationName": "Balham", "crs": "BAL", "st": "12:29", "et": "On time"},
+                    {"locationName": "North Pole Junction", "crs": "NPLE813", "st": "12:57", "et": "On time"},
+                    {"locationName": "Willesden Junction", "crs": "WIJ", "st": "13:02", "et": "On time"},
+                ]
+            }
+        ],
+    )
+
+    async def fake_get_service_route(crs: str, service_id: str, use_cache: bool = True):
+        return service
+
+    calls: list[str] = []
+
+    def fake_schedule_nr_board_prefetch(crs: str):
+        calls.append(crs)
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route',
+        fake_get_service_route,
+    )
+    monkeypatch.setattr('app.routers.pages.prefetch_service.schedule_nr_board_prefetch', fake_schedule_nr_board_prefetch)
+
+    client = TestClient(app)
+    response = client.get('/service/SRS/service-4/refresh')
+
+    assert response.status_code == 200
+    assert set(calls) == {"SRS", "BAL", "WIJ"}

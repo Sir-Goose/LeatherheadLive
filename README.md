@@ -283,8 +283,10 @@ Common status behavior:
 ### Run tests
 
 ```bash
-pytest
+.venv/bin/pytest
 ```
+
+If your shell session already has the venv activated, `pytest` is fine.
 
 ### Core modules
 
