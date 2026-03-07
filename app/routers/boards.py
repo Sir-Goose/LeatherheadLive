@@ -1,6 +1,7 @@
+from ipaddress import ip_address
 from typing import List
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.middleware.cache import cache
 from app.models.board import BoardResponse, Train
@@ -19,6 +20,32 @@ from app.services.tfl_api import (
 )
 
 router = APIRouter(prefix="/api/boards", tags=["boards"])
+
+
+def _request_is_local(request: Request) -> bool:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        forwarded_host = forwarded_for.split(",", 1)[0].strip()
+        if not forwarded_host:
+            return False
+        try:
+            return ip_address(forwarded_host).is_loopback
+        except ValueError:
+            return False
+
+    client = request.client
+    if client is None or not client.host:
+        return False
+
+    try:
+        return ip_address(client.host).is_loopback
+    except ValueError:
+        return False
+
+
+def ensure_local_request(request: Request) -> None:
+    if not _request_is_local(request):
+        raise HTTPException(status_code=403, detail="Cache management is restricted to local requests.")
 
 
 async def fetch_nr_board_or_raise(crs_code: str, use_cache: bool) -> BoardFetchResult:
@@ -126,13 +153,15 @@ async def get_tfl_passing(stop_point_id: str):
 
 
 @router.delete("/{crs_code}/cache")
-async def clear_station_cache(crs_code: str):
+async def clear_station_cache(crs_code: str, request: Request):
+    ensure_local_request(request)
     rail_api_service.clear_cache(crs_code)
     return {"success": True, "message": f"Cache cleared for station {crs_code.upper()}"}
 
 
 @router.delete("/cache/all")
-async def clear_all_cache():
+async def clear_all_cache(request: Request):
+    ensure_local_request(request)
     size = cache.size()
     cache.clear()
     return {"success": True, "message": f"Cleared {size} cached entries"}

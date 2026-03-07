@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Location(BaseModel):
@@ -40,8 +40,7 @@ class Train(BaseModel):
     previous_calling_points: Optional[List[CallingPointList]] = Field(default_factory=list, alias='previousCallingPoints')
     subsequent_calling_points: Optional[List[CallingPointList]] = Field(default_factory=list, alias='subsequentCallingPoints')
     
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
     
     @property
     def is_departing(self) -> bool:
@@ -165,8 +164,7 @@ class Board(BaseModel):
     trains: List[Train] = Field(default_factory=list, alias='trainServices')
     nrcc_messages: Optional[List[dict]] = Field(None, alias='nrccMessages')
     
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
     
     @property
     def departures(self) -> List[Train]:
@@ -300,8 +298,7 @@ class ServiceDetails(BaseModel):
     detachFront: Optional[bool] = False
     isReverseFormation: Optional[bool] = False
     
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
     
     @property
     def all_previous_stops(self) -> List[CallingPoint]:

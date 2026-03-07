@@ -98,6 +98,9 @@ def test_nr_board_content_prefetch_runs_for_fresh_board(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [("LHD", "abc123")]
+    assert 'hx-get="/board/nr/LHD/departures/content"' in response.text
+    assert 'Find Another Station' in response.text
+    assert 'Passing Through' in response.text
 
 
 def test_nr_board_refresh_prefetch_runs_for_fresh_board(monkeypatch):
@@ -130,6 +133,67 @@ def test_nr_board_refresh_prefetch_runs_for_fresh_board(monkeypatch):
 
     assert response.status_code == 200
     assert calls == [("LHD", "abc123")]
+    assert 'table-container' in response.text
+    assert 'Find Another Station' not in response.text
+
+
+def test_board_search_defaults_invalid_view_to_departures_redirect():
+    client = TestClient(app)
+    response = client.get('/board?crs=lhd&view=bogus', follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers['location'] == '/board/nr/LHD/departures'
+
+
+def test_board_search_preserves_valid_passing_view_redirect():
+    client = TestClient(app)
+    response = client.get('/board?crs=lhd&view=passing', follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers['location'] == '/board/nr/LHD/passing'
+
+
+def test_board_refresh_nr_invalid_view_returns_204_without_fetch(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    async def fake_get_nr_board_data(crs: str, view: str):
+        calls.append((crs, view))
+        return {
+            "trains": [],
+            "total_trains": 0,
+            "station_name": "Leatherhead",
+            "error": False,
+            "timestamp": "12:00:00",
+            "line_status": [],
+            "from_cache": False,
+        }
+
+    monkeypatch.setattr('app.routers.pages.get_nr_board_data', fake_get_nr_board_data)
+
+    client = TestClient(app)
+    response = client.get('/board/nr/LHD/bogus/refresh')
+
+    assert response.status_code == 204
+    assert calls == []
+
+
+def test_board_refresh_nr_returns_204_on_fetch_error_without_prefetch(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_get_nr_board_data(crs: str, view: str):
+        raise RuntimeError('boom')
+
+    def fake_schedule_nr_service_prefetch(crs: str, service_id: str):
+        calls.append(service_id)
+
+    monkeypatch.setattr('app.routers.pages.get_nr_board_data', fake_get_nr_board_data)
+    monkeypatch.setattr('app.routers.pages.prefetch_service.schedule_nr_service_prefetch', fake_schedule_nr_service_prefetch)
+
+    client = TestClient(app)
+    response = client.get('/board/nr/LHD/departures/refresh')
+
+    assert response.status_code == 204
+    assert calls == []
 
 
 def test_nr_service_page_prefetches_clickable_boards(monkeypatch):
@@ -262,6 +326,36 @@ def test_nr_service_page_uses_timetable_fallback(monkeypatch):
     assert "London Waterloo" in response.text
 
 
+def test_nr_service_page_returns_expired_template_when_missing(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_get_service_route_cached(crs: str, service_id: str, use_cache: bool = True):
+        return None
+
+    async def fake_get_service_route_from_timetable(crs: str, service_id: str):
+        return None
+
+    def fake_schedule_nr_board_prefetch(crs: str):
+        calls.append(crs)
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_cached',
+        fake_get_service_route_cached,
+    )
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_from_timetable',
+        fake_get_service_route_from_timetable,
+    )
+    monkeypatch.setattr('app.routers.pages.prefetch_service.schedule_nr_board_prefetch', fake_schedule_nr_board_prefetch)
+
+    client = TestClient(app)
+    response = client.get('/service/LHD/missing-service')
+
+    assert response.status_code == 404
+    assert 'Service Expired' in response.text
+    assert calls == []
+
+
 def test_nr_service_refresh_uses_timetable_fallback(monkeypatch):
     service = ServiceDetails(
         generatedAt="2026-01-01T12:00:00+00:00",
@@ -299,6 +393,36 @@ def test_nr_service_refresh_uses_timetable_fallback(monkeypatch):
 
     assert response.status_code == 200
     assert "Leatherhead" in response.text
+
+
+def test_nr_service_refresh_returns_inline_error_when_missing(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_get_service_route(crs: str, service_id: str, use_cache: bool = True):
+        return None
+
+    async def fake_get_service_route_from_timetable(crs: str, service_id: str):
+        return None
+
+    def fake_schedule_nr_board_prefetch(crs: str):
+        calls.append(crs)
+
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route',
+        fake_get_service_route,
+    )
+    monkeypatch.setattr(
+        'app.routers.pages.rail_api_service.get_service_route_from_timetable',
+        fake_get_service_route_from_timetable,
+    )
+    monkeypatch.setattr('app.routers.pages.prefetch_service.schedule_nr_board_prefetch', fake_schedule_nr_board_prefetch)
+
+    client = TestClient(app)
+    response = client.get('/service/LHD/missing-service/refresh')
+
+    assert response.status_code == 200
+    assert 'Service no longer available' in response.text
+    assert calls == []
 
 
 def test_nr_service_refresh_excludes_non_station_timing_points(monkeypatch):

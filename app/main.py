@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -29,6 +30,15 @@ def detect_asset_version() -> str:
     except Exception:
         pass
     return settings.app_version
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        return response
 
 
 @asynccontextmanager
@@ -71,6 +81,7 @@ app.add_middleware(
 
 # Configure GZip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 # Include routers
@@ -94,8 +105,9 @@ async def not_found_handler(request: Request, exc: HTTPException):
         crs = path_parts[2] if len(path_parts) > 2 else "UNKNOWN"
         
         return templates.TemplateResponse(
+            request,
             "errors/404.html",
-            {"request": request, "crs": crs},
+            {"crs": crs},
             status_code=404
         )
 
@@ -110,8 +122,9 @@ async def server_error_handler(request: Request, exc: Exception):
         )
     else:
         return templates.TemplateResponse(
+            request,
             "errors/500.html",
-            {"request": request},
+            {},
             status_code=500
         )
 
@@ -154,8 +167,9 @@ async def global_exception_handler(request, exc):
     else:
         # For web routes, return HTML error page
         return templates.TemplateResponse(
+            request,
             "errors/500.html",
-            {"request": request},
+            {},
             status_code=500
         )
 

@@ -6,6 +6,14 @@ from fastapi.templating import Jinja2Templates
 
 from app.middleware.cache import cache
 from app.models.tfl import TflBoard
+from app.routers.page_validation import (
+    is_valid_refresh_view,
+    normalize_board_search_view,
+    validate_crs,
+    validate_tfl_line_id,
+    validate_tfl_stop_id,
+    validate_view,
+)
 from app.services.display_mapper import group_tfl_trains_by_line, map_nr_trains, map_tfl_predictions
 from app.services.prefetch import prefetch_service
 from app.services.rail_api import BoardNotFoundError, RailAPIError, rail_api_service
@@ -20,35 +28,88 @@ COMMON_HOMEPAGE_NR_CRS = [
 COMMON_HOMEPAGE_TFL_STOPS = ["940GZZLUWSM"]
 
 
-def validate_crs(crs: str) -> str:
-    if not crs or len(crs) != 3 or not crs.isalpha():
-        raise HTTPException(status_code=404, detail="Invalid CRS code")
-    return crs.upper()
+def _nr_trains_for_view(board, view: str):
+    if view == "departures":
+        return board.departures
+    if view == "arrivals":
+        return board.arrivals
+    return board.passing_through
 
 
-def validate_tfl_stop_id(stop_point_id: str) -> str:
-    stop_point_id = stop_point_id.strip()
-    if not stop_point_id:
-        raise HTTPException(status_code=404, detail="Invalid TfL stop point id")
-    return stop_point_id
+def _build_tfl_service_detail_params(
+    line_id: str,
+    from_stop_id: str,
+    to_stop_id: str,
+    direction: Optional[str] = None,
+    trip_id: Optional[str] = None,
+    vehicle_id: Optional[str] = None,
+    expected_arrival: Optional[str] = None,
+    station_name: Optional[str] = None,
+    destination_name: Optional[str] = None,
+) -> dict:
+    return {
+        "line_id": validate_tfl_line_id(line_id),
+        "from_stop_id": validate_tfl_stop_id(from_stop_id),
+        "to_stop_id": validate_tfl_stop_id(to_stop_id),
+        "direction": direction,
+        "trip_id": trip_id,
+        "vehicle_id": vehicle_id,
+        "expected_arrival": expected_arrival,
+        "station_name": station_name,
+        "destination_name": destination_name,
+    }
 
 
-def validate_tfl_line_id(line_id: str) -> str:
-    line_id = line_id.strip().lower()
-    if not line_id:
-        raise HTTPException(status_code=404, detail="Invalid TfL line id")
-    return line_id
+def _tfl_service_refresh_url(request: Request, line_id: str, from_stop_id: str, to_stop_id: str) -> str:
+    refresh_url = f"/service/tfl/{line_id}/{from_stop_id}/{to_stop_id}/refresh"
+    if request.url.query:
+        refresh_url = f"{refresh_url}?{request.url.query}"
+    return refresh_url
 
 
-def validate_view(view: str, provider: str) -> str:
+def _build_board_context(request: Request, provider: str, board_id: str, view: str, board: dict) -> dict:
+    context = {
+        "request": request,
+        "provider": provider,
+        "board_id": board_id,
+        "crs": board_id,
+        "station_name": board["station_name"],
+        "view": view,
+        "trains": board["trains"],
+        "total_trains": board["total_trains"],
+        "error": board["error"],
+        "timestamp": board["timestamp"],
+        "line_status": board["line_status"],
+    }
+    if provider == "tfl":
+        context["line_groups"] = board["line_groups"]
+    return context
+
+
+def _render_board_content_response(request: Request, provider: str, board_id: str, view: str, board: dict) -> HTMLResponse:
+    tabs_html = templates.get_template("partials/tabs.html").render(provider=provider, board_id=board_id, view=view)
+    board_content_html = templates.get_template("partials/board_content.html").render(
+        **_build_board_context(request, provider, board_id, view, board)
+    )
+    search_form_html = templates.get_template("partials/search_form.html").render(view=view)
+    return HTMLResponse(content=tabs_html + board_content_html + search_form_html)
+
+
+def _refresh_error_response() -> HTMLResponse:
+    return HTMLResponse(status_code=204)
+
+
+def _build_refresh_context(request: Request, provider: str, board_id: str, view: str, board: dict) -> dict:
+    context = _build_board_context(request, provider, board_id, view, board)
+    context.pop("board_id", None)
+    context.pop("total_trains", None)
+    return context
+
+
+def _render_board_refresh_response(request: Request, provider: str, board_id: str, view: str, board: dict):
     if provider == "nr":
-        allowed = {"departures", "arrivals", "passing"}
-    else:
-        allowed = {"departures", "arrivals"}
-
-    if view not in allowed:
-        raise HTTPException(status_code=404, detail="Invalid view")
-    return view
+        return templates.TemplateResponse(request, f"partials/{view}_table.html", _build_refresh_context(request, provider, board_id, view, board))
+    return templates.TemplateResponse(request, "partials/tfl_refresh_content.html", _build_refresh_context(request, provider, board_id, view, board))
 
 
 async def get_nr_board_data(crs: str, view: str):
@@ -57,12 +118,7 @@ async def get_nr_board_data(crs: str, view: str):
     try:
         result = await rail_api_service.get_board(crs, use_cache=True)
         board = result.board
-        if view == "departures":
-            trains = board.departures
-        elif view == "arrivals":
-            trains = board.arrivals
-        else:
-            trains = board.passing_through
+        trains = _nr_trains_for_view(board, view)
 
         updated_timestamp = format_updated_at(board.pulled_at or board.generated_at)
         return {
@@ -81,12 +137,7 @@ async def get_nr_board_data(crs: str, view: str):
         if cached_board:
             if isinstance(cached_board, dict):
                 cached_board = rail_api_service._parse_board(cached_board)
-            if view == "departures":
-                trains = cached_board.departures
-            elif view == "arrivals":
-                trains = cached_board.arrivals
-            else:
-                trains = cached_board.passing_through
+            trains = _nr_trains_for_view(cached_board, view)
 
             updated_timestamp = format_updated_at(cached_board.pulled_at or cached_board.generated_at)
             return {
@@ -212,14 +263,13 @@ def schedule_tfl_service_boards_prefetch(service) -> None:
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     schedule_homepage_board_prefetches()
-    return templates.TemplateResponse("index.html", {"request": request, "timestamp": current_time_hms()})
+    return templates.TemplateResponse(request, "index.html", {"timestamp": current_time_hms()})
 
 
 @router.get("/board", response_class=RedirectResponse)
 async def board_search(crs: str, view: Optional[str] = "departures"):
     crs = validate_crs(crs)
-    if view not in ["departures", "arrivals", "passing"]:
-        view = "departures"
+    view = normalize_board_search_view(view)
     return RedirectResponse(url=f"/board/nr/{crs}/{view}", status_code=303)
 
 
@@ -232,16 +282,18 @@ async def service_detail_page(request: Request, crs: str, service_id: str):
 
     if not service:
         return templates.TemplateResponse(
+            request,
             "errors/service_expired.html",
-            {"request": request, "service_id": service_id, "timestamp": current_time_hms()},
+            {"service_id": service_id, "timestamp": current_time_hms()},
             status_code=404,
         )
 
     schedule_nr_service_boards_prefetch(service)
 
     return templates.TemplateResponse(
+        request,
         "service_detail.html",
-        {"request": request, "service": service, "timestamp": format_updated_at(service.pulledAt or service.generatedAt)},
+        {"service": service, "timestamp": format_updated_at(service.pulledAt or service.generatedAt)},
     )
 
 
@@ -258,8 +310,9 @@ async def service_detail_refresh(request: Request, crs: str, service_id: str):
     schedule_nr_service_boards_prefetch(service)
 
     return templates.TemplateResponse(
+        request,
         "partials/service_timeline.html",
-        {"request": request, "service": service, "timestamp": format_updated_at(service.pulledAt or service.generatedAt)},
+        {"service": service, "timestamp": format_updated_at(service.pulledAt or service.generatedAt)},
     )
 
 
@@ -276,29 +329,26 @@ async def tfl_service_detail_page(
     station_name: Optional[str] = None,
     destination_name: Optional[str] = None,
 ):
-    line_id = validate_tfl_line_id(line_id)
-    from_stop_id = validate_tfl_stop_id(from_stop_id)
-    to_stop_id = validate_tfl_stop_id(to_stop_id)
+    params = _build_tfl_service_detail_params(
+        line_id,
+        from_stop_id,
+        to_stop_id,
+        direction=direction,
+        trip_id=trip_id,
+        vehicle_id=vehicle_id,
+        expected_arrival=expected_arrival,
+        station_name=station_name,
+        destination_name=destination_name,
+    )
 
     try:
-        service = await tfl_api_service.get_service_route_detail_cached(
-            line_id=line_id,
-            from_stop_id=from_stop_id,
-            to_stop_id=to_stop_id,
-            direction=direction,
-            trip_id=trip_id,
-            vehicle_id=vehicle_id,
-            expected_arrival=expected_arrival,
-            station_name=station_name,
-            destination_name=destination_name,
-            use_cache=True,
-        )
+        service = await tfl_api_service.get_service_route_detail_cached(**params, use_cache=True)
     except (TflBoardNotFoundError, TflAPIError):
         return templates.TemplateResponse(
+            request,
             "errors/service_expired.html",
             {
-                "request": request,
-                "service_id": f"{line_id}:{from_stop_id}:{to_stop_id}",
+                "service_id": f"{params['line_id']}:{params['from_stop_id']}:{params['to_stop_id']}",
                 "timestamp": current_time_hms(),
             },
             status_code=404,
@@ -306,16 +356,17 @@ async def tfl_service_detail_page(
 
     schedule_tfl_service_boards_prefetch(service)
 
-    refresh_url = f"/service/tfl/{line_id}/{from_stop_id}/{to_stop_id}/refresh"
-    if request.url.query:
-        refresh_url = f"{refresh_url}?{request.url.query}"
-
     return templates.TemplateResponse(
+        request,
         "tfl_service_detail.html",
         {
-            "request": request,
             "service": service,
-            "refresh_url": refresh_url,
+            "refresh_url": _tfl_service_refresh_url(
+                request,
+                params["line_id"],
+                params["from_stop_id"],
+                params["to_stop_id"],
+            ),
             "timestamp": format_updated_at(service.pulled_at),
         },
     )
@@ -334,23 +385,20 @@ async def tfl_service_detail_refresh(
     station_name: Optional[str] = None,
     destination_name: Optional[str] = None,
 ):
-    line_id = validate_tfl_line_id(line_id)
-    from_stop_id = validate_tfl_stop_id(from_stop_id)
-    to_stop_id = validate_tfl_stop_id(to_stop_id)
+    params = _build_tfl_service_detail_params(
+        line_id,
+        from_stop_id,
+        to_stop_id,
+        direction=direction,
+        trip_id=trip_id,
+        vehicle_id=vehicle_id,
+        expected_arrival=expected_arrival,
+        station_name=station_name,
+        destination_name=destination_name,
+    )
 
     try:
-        service = await tfl_api_service.get_service_route_detail(
-            line_id=line_id,
-            from_stop_id=from_stop_id,
-            to_stop_id=to_stop_id,
-            direction=direction,
-            trip_id=trip_id,
-            vehicle_id=vehicle_id,
-            expected_arrival=expected_arrival,
-            station_name=station_name,
-            destination_name=destination_name,
-            use_cache=False,
-        )
+        service = await tfl_api_service.get_service_route_detail(**params, use_cache=False)
     except (TflBoardNotFoundError, TflAPIError):
         return HTMLResponse(
             content="<div class='error-message'>Route no longer available</div>",
@@ -360,8 +408,9 @@ async def tfl_service_detail_refresh(
     schedule_tfl_service_boards_prefetch(service)
 
     return templates.TemplateResponse(
+        request,
         "partials/tfl_service_timeline.html",
-        {"request": request, "service": service, "timestamp": format_updated_at(service.pulled_at)},
+        {"service": service, "timestamp": format_updated_at(service.pulled_at)},
     )
 
 
@@ -385,22 +434,7 @@ async def board_view_nr(request: Request, crs: str, view: str):
     board = await get_nr_board_data(crs, view)
     schedule_nr_board_prefetch(crs, board)
 
-    return templates.TemplateResponse(
-        "board.html",
-        {
-            "request": request,
-            "provider": "nr",
-            "board_id": crs,
-            "crs": crs,
-            "station_name": board["station_name"],
-            "view": view,
-            "trains": board["trains"],
-            "total_trains": board["total_trains"],
-            "error": board["error"],
-            "timestamp": board["timestamp"],
-            "line_status": board["line_status"],
-        },
-    )
+    return templates.TemplateResponse(request, "board.html", _build_board_context(request, "nr", crs, view, board))
 
 
 @router.get("/board/tfl/{stop_point_id}/{view}", response_class=HTMLResponse)
@@ -410,23 +444,7 @@ async def board_view_tfl(request: Request, stop_point_id: str, view: str):
     board = await get_tfl_board_data(stop_point_id, view)
     schedule_tfl_board_prefetch(board)
 
-    return templates.TemplateResponse(
-        "board.html",
-        {
-            "request": request,
-            "provider": "tfl",
-            "board_id": stop_point_id,
-            "crs": stop_point_id,
-            "station_name": board["station_name"],
-            "view": view,
-            "trains": board["trains"],
-            "line_groups": board["line_groups"],
-            "total_trains": board["total_trains"],
-            "error": board["error"],
-            "timestamp": board["timestamp"],
-            "line_status": board["line_status"],
-        },
-    )
+    return templates.TemplateResponse(request, "board.html", _build_board_context(request, "tfl", stop_point_id, view, board))
 
 
 @router.get("/board/nr/{crs}/{view}/content", response_class=HTMLResponse)
@@ -436,21 +454,7 @@ async def board_content_nr(request: Request, crs: str, view: str):
     board = await get_nr_board_data(crs, view)
     schedule_nr_board_prefetch(crs, board)
 
-    tabs_html = templates.get_template("partials/tabs.html").render(provider="nr", board_id=crs, view=view)
-    board_content_html = templates.get_template("partials/board_content.html").render(
-        request=request,
-        provider="nr",
-        board_id=crs,
-        crs=crs,
-        view=view,
-        trains=board["trains"],
-        error=board["error"],
-        timestamp=board["timestamp"],
-        line_status=board["line_status"],
-    )
-    search_form_html = templates.get_template("partials/search_form.html").render(view=view)
-
-    return HTMLResponse(content=tabs_html + board_content_html + search_form_html)
+    return _render_board_content_response(request, "nr", crs, view, board)
 
 
 @router.get("/board/tfl/{stop_point_id}/{view}/content", response_class=HTMLResponse)
@@ -460,71 +464,32 @@ async def board_content_tfl(request: Request, stop_point_id: str, view: str):
     board = await get_tfl_board_data(stop_point_id, view)
     schedule_tfl_board_prefetch(board)
 
-    tabs_html = templates.get_template("partials/tabs.html").render(provider="tfl", board_id=stop_point_id, view=view)
-    board_content_html = templates.get_template("partials/board_content.html").render(
-        request=request,
-        provider="tfl",
-        board_id=stop_point_id,
-        crs=stop_point_id,
-        view=view,
-        trains=board["trains"],
-        line_groups=board["line_groups"],
-        error=board["error"],
-        timestamp=board["timestamp"],
-        line_status=board["line_status"],
-    )
-    search_form_html = templates.get_template("partials/search_form.html").render(view=view)
-
-    return HTMLResponse(content=tabs_html + board_content_html + search_form_html)
+    return _render_board_content_response(request, "tfl", stop_point_id, view, board)
 
 
 @router.get("/board/nr/{crs}/{view}/refresh", response_class=HTMLResponse)
 async def board_refresh_nr(request: Request, crs: str, view: str):
     crs = validate_crs(crs)
-    if view not in ["departures", "arrivals", "passing"]:
-        return HTMLResponse(status_code=204)
+    if not is_valid_refresh_view(view, "nr"):
+        return _refresh_error_response()
 
     try:
         board = await get_nr_board_data(crs, view)
         schedule_nr_board_prefetch(crs, board)
-        return templates.TemplateResponse(
-            f"partials/{view}_table.html",
-            {
-                "request": request,
-                "provider": "nr",
-                "crs": crs,
-                "trains": board["trains"],
-                "error": board["error"],
-                "timestamp": board["timestamp"],
-                "line_status": board["line_status"],
-            },
-        )
+        return _render_board_refresh_response(request, "nr", crs, view, board)
     except Exception:
-        return HTMLResponse(status_code=204)
+        return _refresh_error_response()
 
 
 @router.get("/board/tfl/{stop_point_id}/{view}/refresh", response_class=HTMLResponse)
 async def board_refresh_tfl(request: Request, stop_point_id: str, view: str):
     stop_point_id = validate_tfl_stop_id(stop_point_id)
-    if view not in ["departures", "arrivals"]:
-        return HTMLResponse(status_code=204)
+    if not is_valid_refresh_view(view, "tfl"):
+        return _refresh_error_response()
 
     try:
         board = await get_tfl_board_data(stop_point_id, view)
         schedule_tfl_board_prefetch(board)
-        return templates.TemplateResponse(
-            "partials/tfl_refresh_content.html",
-            {
-                "request": request,
-                "provider": "tfl",
-                "crs": stop_point_id,
-                "view": view,
-                "trains": board["trains"],
-                "line_groups": board["line_groups"],
-                "error": board["error"],
-                "timestamp": board["timestamp"],
-                "line_status": board["line_status"],
-            },
-        )
+        return _render_board_refresh_response(request, "tfl", stop_point_id, view, board)
     except Exception:
-        return HTMLResponse(status_code=204)
+        return _refresh_error_response()

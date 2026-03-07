@@ -47,18 +47,18 @@ async def search(
     # No results = show empty state message
     if not results:
         return templates.TemplateResponse(
+            request,
             "partials/station_search_empty.html",
             {
-                "request": request,
                 "query": q
             }
         )
     
     # Return results as HTML fragment
     return templates.TemplateResponse(
+        request,
         "partials/station_search_results.html",
         {
-            "request": request,
             "results": results,
             "view": view
         }
