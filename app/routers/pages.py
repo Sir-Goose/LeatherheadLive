@@ -23,7 +23,7 @@ from app.utils.time import current_time_hms, format_updated_at
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 COMMON_HOMEPAGE_NR_CRS = [
-    "LHD", "WIM", "EPS", "WAT", "VIC", "PAD", "KGX", "LST", "EUS", "STP", "CHX", "CST", "LBG", "MYB"
+    "LHD", "WIM", "DMS", "WAT", "VIC", "PAD", "KGX", "LST", "EUS", "STP", "CHX", "CST", "LBG", "MYB"
 ]
 COMMON_HOMEPAGE_TFL_STOPS = ["940GZZLUWSM"]
 
